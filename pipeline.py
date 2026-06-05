@@ -19,6 +19,11 @@ _WY_PLAYERS_URL = "https://raw.githubusercontent.com/koenvo/wyscout-soccer-match
 _wy_names_cache = None
 
 
+def _fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "football-pipeline"})
+    return urllib.request.urlopen(req, timeout=60).read()
+
+
 def wyscout_player_names():
     """playerId -> name map for the Wyscout open dataset (names aren't in the
     event files). Fetched once and memoized; at scale this should be cached to disk."""
@@ -56,6 +61,14 @@ PROVIDERS = {
             lineup_data=f"https://raw.githubusercontent.com/statsbomb/open-data/master/data/lineups/{mid}.json",
             coordinates="kloppy",
         ),
+        # kloppy's StatsBomb raw_event STRIPS the type-specific block (shot/pass:
+        # freeze_frame, statsbomb_xg, technique...). Fetch the original events file
+        # and join the complete record by id so nothing is lost. ~98% of events match;
+        # the rest are dropped admin events.
+        "full_raw": lambda mid: {
+            str(e["id"]): e for e in json.loads(_fetch(
+                f"https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{mid}.json"))
+        },
     },
     "wyscout": {
         # Wyscout v2 raw event -> eventName (no promote/drop needed: maps cleanly,
@@ -65,6 +78,7 @@ PROVIDERS = {
         "promote": {},
         "drop": set(),
         "load": lambda mid: wyscout.load_open_data(match_id=int(mid), coordinates="kloppy"),
+        "full_raw": None,  # kloppy's Wyscout raw_event is already complete (keeps 'tags')
     },
 }
 
@@ -88,7 +102,7 @@ def enum_val(x):
     return getattr(v, "value", v)
 
 
-def flatten(event, cfg, provider, match_id, names, context):
+def flatten(event, cfg, provider, match_id, names, context, full_raw):
     raw = getattr(event, "raw_event", None) or {}
     kind = event.event_type.value          # e.g. 'PASS', 'generic'
     rtype = cfg["raw_type"](raw)           # original provider label
@@ -150,21 +164,31 @@ def flatten(event, cfg, provider, match_id, names, context):
         "body_part": body_part,
         "set_piece": set_piece,
         "qualifiers_json": json.dumps(qual) if qual else None,
-        "raw_event_json": json.dumps(raw, default=str),
+        # complete original record: StatsBomb joined from source by id (kloppy's is
+        # stripped); Wyscout uses kloppy's raw_event (already complete).
+        "raw_event_json": json.dumps(
+            (full_raw.get(str(event.event_id)) if full_raw else None) or raw, default=str),
     }
 
 
-def ingest(provider, match_id):
+def match_rows(provider, match_id):
+    """Load one match and return (rows, n_loaded, n_dropped). Reusable by bulk driver."""
     cfg = PROVIDERS[provider]
     ds = cfg["load"](match_id)
     names = cfg["names"]() if cfg["names"] else None
     context = match_context.resolve(provider, match_id)
+    full_raw = cfg["full_raw"](match_id) if cfg.get("full_raw") else None
     total = len(ds.events)
     rows, dropped = [], 0
     for e in ds.events:
-        r = flatten(e, cfg, provider, match_id, names, context)
+        r = flatten(e, cfg, provider, match_id, names, context, full_raw)
         (rows.append(r) if r is not None else None)
         dropped += r is None
+    return rows, total, dropped
+
+
+def ingest(provider, match_id):
+    rows, total, dropped = match_rows(provider, match_id)
     df = pl.DataFrame(rows, schema=SCHEMA)
     out = f"events_{provider}_{match_id}.parquet"
     df.write_parquet(out)
