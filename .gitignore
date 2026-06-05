@@ -1,0 +1,7 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated data (regenerable via pipeline.py)
+*.parquet
