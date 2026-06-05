@@ -5,3 +5,6 @@ __pycache__/
 
 # Generated data (regenerable via pipeline.py)
 *.parquet
+
+# Cached match-context indexes (rebuilt from source on demand)
+.cache/

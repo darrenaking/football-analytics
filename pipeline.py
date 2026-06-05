@@ -13,6 +13,8 @@ import urllib.request
 import polars as pl
 from kloppy import statsbomb, wyscout
 
+import match_context
+
 _WY_PLAYERS_URL = "https://raw.githubusercontent.com/koenvo/wyscout-soccer-match-event-dataset/main/raw_data/players.json"
 _wy_names_cache = None
 
@@ -75,13 +77,9 @@ SCHEMA = [
     "qualifiers_json", "raw_event_json",
 ]
 
-# Match context isn't in the event files; resolved externally. For this PoC we
-# supply known values per match. At scale: StatsBomb matches index + Wyscout
-# matches.zip provide competition/season/date for every match_id.
-MATCH_CONTEXT = {
-    ("statsbomb", "8658"): {"competition": "FIFA World Cup", "season": "2018", "match_date": "2018-07-15"},
-    ("wyscout", "2058002"): {"competition": "FIFA World Cup", "season": "2018", "match_date": "2018-06-30"},
-}
+# Match context (competition/season/date) isn't in the event files; it's resolved
+# automatically per match_id from each provider's match-metadata index.
+# See match_context.py.
 
 
 def enum_val(x):
@@ -160,7 +158,7 @@ def ingest(provider, match_id):
     cfg = PROVIDERS[provider]
     ds = cfg["load"](match_id)
     names = cfg["names"]() if cfg["names"] else None
-    context = MATCH_CONTEXT.get((provider, str(match_id)), {})
+    context = match_context.resolve(provider, match_id)
     total = len(ds.events)
     rows, dropped = [], 0
     for e in ds.events:
