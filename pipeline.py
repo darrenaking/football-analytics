@@ -9,7 +9,12 @@ Decisions encoded here (see project memory):
 Run: .venv/bin/python pipeline.py
 """
 import json
+import os
+import subprocess
+import time
+import urllib.error
 import urllib.request
+
 import polars as pl
 from kloppy import statsbomb, wyscout
 
@@ -18,25 +23,108 @@ import match_context
 _WY_PLAYERS_URL = "https://raw.githubusercontent.com/koenvo/wyscout-soccer-match-event-dataset/main/raw_data/players.json"
 _wy_names_cache = None
 
+# --- robust fetching -------------------------------------------------------
+# The earlier bulk run was rate-limited by GitHub: thousands of raw-file
+# requests in minutes -> refusals that look like "file not found". Fixes:
+#  - download every file through one fetcher with retry + exponential backoff
+#  - cache to .cache/raw/ so re-runs (and the full_raw join) never re-download
+#  - light throttle + optional GitHub token to stay under the limit
+RAW_CACHE = os.path.join(".cache", "raw")
+_THROTTLE_S = 0.05
 
-def _fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "football-pipeline"})
-    return urllib.request.urlopen(req, timeout=60).read()
+
+def _gh_token():
+    try:
+        return subprocess.run(["gh", "auth", "token"], capture_output=True, text=True,
+                              timeout=10).stdout.strip() or None
+    except Exception:
+        return None
+
+
+_TOKEN = _gh_token()
+
+
+def _headers():
+    h = {"User-Agent": "football-pipeline"}
+    if _TOKEN:
+        h["Authorization"] = f"token {_TOKEN}"
+    return h
+
+
+def fetch_bytes(url, retries=6):
+    """GET url with retry + exponential backoff on rate-limit/transient errors.
+    Genuine 404s raise immediately (real missing file, not a retry case)."""
+    delay = 1.0
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=_headers()), timeout=60) as r:
+                data = r.read()
+            time.sleep(_THROTTLE_S)
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
+def fetch_to_cache(url):
+    """Download url once to a local path under RAW_CACHE and return that path.
+    Subsequent calls (incl. the full_raw join) read the cached file."""
+    rel = url.split("/main/")[-1].split("/master/")[-1].replace("/", "__")
+    path = os.path.join(RAW_CACHE, rel)
+    if not os.path.exists(path):
+        data = fetch_bytes(url)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic: a partial download never looks complete
+    return path
 
 
 def wyscout_player_names():
     """playerId -> name map for the Wyscout open dataset (names aren't in the
-    event files). Fetched once and memoized; at scale this should be cached to disk."""
+    event files). Fetched once and memoized."""
     global _wy_names_cache
     if _wy_names_cache is None:
-        req = urllib.request.Request(_WY_PLAYERS_URL, headers={"User-Agent": "football-pipeline"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            players = json.load(r)
+        players = json.loads(fetch_bytes(_WY_PLAYERS_URL))
         _wy_names_cache = {
             str(p["wyId"]): (p.get("shortName") or f"{p.get('firstName','')} {p.get('lastName','')}".strip())
             for p in players
         }
     return _wy_names_cache
+
+
+# --- match loaders: download via the cache, then hand kloppy local paths -----
+_SB_EVENTS = "https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{}.json"
+_SB_LINEUP = "https://raw.githubusercontent.com/statsbomb/open-data/master/data/lineups/{}.json"
+_WY_EVENTS = "https://raw.githubusercontent.com/koenvo/wyscout-soccer-match-event-dataset/main/processed-v2/files/{}.json"
+
+
+def _sb_load(mid):
+    ev = fetch_to_cache(_SB_EVENTS.format(mid))
+    lu = fetch_to_cache(_SB_LINEUP.format(mid))
+    return statsbomb.load(event_data=ev, lineup_data=lu, coordinates="kloppy")
+
+
+def _sb_full_raw(mid):
+    # reads the events file already cached by _sb_load -> no second download
+    with open(fetch_to_cache(_SB_EVENTS.format(mid))) as f:
+        return {str(e["id"]): e for e in json.load(f)}
+
+
+def _wy_load(mid):
+    ev = fetch_to_cache(_WY_EVENTS.format(mid))
+    return wyscout.load(event_data=ev, coordinates="kloppy")
+
 
 # --- per-provider config: the only parts that differ between sources ---------
 PROVIDERS = {
@@ -56,19 +144,11 @@ PROVIDERS = {
             "Camera On", "Camera off", "Half Start", "Half End",
             "Starting XI", "Injury Stoppage", "Referee Ball-Drop",
         },
-        "load": lambda mid: statsbomb.load(
-            event_data=f"https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{mid}.json",
-            lineup_data=f"https://raw.githubusercontent.com/statsbomb/open-data/master/data/lineups/{mid}.json",
-            coordinates="kloppy",
-        ),
+        "load": _sb_load,
         # kloppy's StatsBomb raw_event STRIPS the type-specific block (shot/pass:
-        # freeze_frame, statsbomb_xg, technique...). Fetch the original events file
-        # and join the complete record by id so nothing is lost. ~98% of events match;
-        # the rest are dropped admin events.
-        "full_raw": lambda mid: {
-            str(e["id"]): e for e in json.loads(_fetch(
-                f"https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{mid}.json"))
-        },
+        # freeze_frame, statsbomb_xg, technique...). Join the complete original
+        # record by id so nothing is lost. ~98% match; rest are dropped admin events.
+        "full_raw": _sb_full_raw,
     },
     "wyscout": {
         # Wyscout v2 raw event -> eventName (no promote/drop needed: maps cleanly,
@@ -77,7 +157,7 @@ PROVIDERS = {
         "names": wyscout_player_names,  # join playerId -> name (not in event files)
         "promote": {},
         "drop": set(),
-        "load": lambda mid: wyscout.load_open_data(match_id=int(mid), coordinates="kloppy"),
+        "load": _wy_load,
         "full_raw": None,  # kloppy's Wyscout raw_event is already complete (keeps 'tags')
     },
 }
